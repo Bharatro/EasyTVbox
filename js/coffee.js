@@ -400,57 +400,6 @@ function filterLiveItems(items = [], league = '', type = '', isHot = false) {
 
 // ========== 直播接口 ==========
 
-async function fetchLiveByApi(page = 1, size = 30, league = '', type = '', isHot = false) {
-    const date = todayString();
-
-    const urls = [
-        `${host}/api/v1/live`,
-        `${host}/api/v1/lives`,
-        `${host}/api/v1/live/list`,
-        `${host}/api/v1/lives/list`,
-        `${host}/api/v1/live/matches`,
-        `${host}/api/v1/matches/live`,
-        `${host}/api/v1/rooms`,
-        `${host}/api/v1/room/list`,
-        `${host}/api/v1/schedule`,
-        `${host}/api/v1/schedules`,
-        `${host}/api/v1/schedule/today`,
-        `${host}/api/v1/matches`
-    ];
-
-    const paramList = [
-        { page, size, limit: size, league, type, date },
-        { page, pageSize: size, league, type, date },
-        { page, per_page: size, league, type, date },
-        { page, size, league, type, status: 'live' },
-        { page, size, league, type, live: 1 },
-        { page, size, league, type, is_live: 1 }
-    ];
-
-    for (const url of urls) {
-        for (const params of paramList) {
-            const cleanParams = {};
-            Object.keys(params).forEach(key => {
-                if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
-                    cleanParams[key] = params[key];
-                }
-            });
-
-            const data = await requestJsonSafe(url, cleanParams, {
-                Referer: host + '/pc/live'
-            });
-
-            const arr = getDataArray(data);
-            if (!arr.length) continue;
-
-            const filtered = filterLiveItems(arr, league, type, isHot);
-            if (filtered.length) return filtered.slice(0, size);
-        }
-    }
-
-    return [];
-}
-
 function parseLiveCardsFromHtml(html = '') {
     const text = safeText(html);
     if (!text || text === '加载中...') return [];
