@@ -1,7 +1,7 @@
 // @name 咖啡直播
 // @author modified by ChatGPT
 // @description 咖啡直播体育赛事直播 + 录像回放
-// @version 1.3.0
+// @version 1.4.0
 
 const host = 'https://kafeizhibo.com';
 
@@ -62,34 +62,37 @@ function getContent(res) {
     return '';
 }
 
-async function requestText(url, params = {}, extraHeaders = {}) {
+async function requestText(url, params = {}, extraHeaders = {}, timeout = 5000) {
     const query = buildQuery(params);
     const finalUrl = query ? `${url}${url.includes('?') ? '&' : '?'}${query}` : url;
-    const r = await req(finalUrl, {
-        headers: Object.assign({}, headers, extraHeaders)
-    });
-    return getContent(r);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+        const r = await req(finalUrl, {
+            headers: Object.assign({}, headers, extraHeaders),
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        return getContent(r);
+    } catch (e) {
+        clearTimeout(timeoutId);
+        throw e;
+    }
 }
 
-async function requestJson(url, params = {}, extraHeaders = {}) {
-    const text = await requestText(url, params, extraHeaders);
+async function requestJson(url, params = {}, extraHeaders = {}, timeout = 5000) {
+    const text = await requestText(url, params, extraHeaders, timeout);
     if (!text) return null;
     return JSON.parse(text);
 }
 
-async function requestJsonSafe(url, params = {}, extraHeaders = {}) {
+async function requestJsonSafe(url, params = {}, extraHeaders = {}, timeout = 5000) {
     try {
-        return await requestJson(url, params, extraHeaders);
+        return await requestJson(url, params, extraHeaders, timeout);
     } catch (e) {
         return null;
-    }
-}
-
-async function requestTextSafe(url, params = {}, extraHeaders = {}) {
-    try {
-        return await requestText(url, params, extraHeaders);
-    } catch (e) {
-        return '';
     }
 }
 
@@ -398,35 +401,22 @@ function filterLiveItems(items = [], league = '', type = '', isHot = false) {
     });
 }
 
-// ========== 直播接口 ==========
+// ========== 优化的直播接口 ==========
 
-async function fetchLiveByApi(page = 1, size = 30, league = '', type = '', isHot = false) {
+const FAST_API_URLS = [
+    `${host}/api/v1/live`,
+    `${host}/api/v1/lives`,
+    `${host}/api/v1/rooms`
+];
+
+async function fetchLiveFast(page = 1, size = 30, league = '', type = '', isHot = false) {
     const date = todayString();
-    const urls = [
-        `${host}/api/v1/live`,
-        `${host}/api/v1/matches/live`,
-        `${host}/api/v1/lives`,
-        `${host}/api/v1/rooms`
-    ];
-    const paramList = [
-        { page, size, league, type, date },
-        { page, size, league, type, is_live: 1 },
-        { page, size, league, type, status: 'live' }
-    ];
-
-    for (const url of urls) {
-        for (const params of paramList) {
-            const cleanParams = {};
-            Object.keys(params).forEach(key => {
-                if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
-                    cleanParams[key] = params[key];
-                }
-            });
-            const data = await requestJsonSafe(url, cleanParams, {
-                Referer: host + '/pc/live'
-            });
-            const arr = getDataArray(data);
-            if (!arr.length) continue;
+    const params = { page, size, date };
+    
+    for (const url of FAST_API_URLS) {
+        const data = await requestJsonSafe(url, params, {}, 3000);
+        const arr = getDataArray(data);
+        if (arr.length) {
             const filtered = filterLiveItems(arr, league, type, isHot);
             if (filtered.length) return filtered.slice(0, size);
         }
@@ -434,21 +424,106 @@ async function fetchLiveByApi(page = 1, size = 30, league = '', type = '', isHot
     return [];
 }
 
-async function fetchLiveByPage(page = 1, size = 30, league = '', type = '', isHot = false) {
-    const html = await requestTextSafe(`${host}/pc/live`, {}, {
-        Referer: host + '/pc/live',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    });
-
-    const arr = parseLiveCardsFromHtml(html);
-    return filterLiveItems(arr, league, type, isHot).slice(0, size);
+async function fetchLiveMatches(page = 1, size = 30, league = '', type = '', isHot = false) {
+    const [apiResult, htmlResult] = await Promise.race([
+        Promise.all([
+            fetchLiveFast(page, size, league, type, isHot),
+            new Promise(resolve => setTimeout(() => resolve(null), 2000))
+        ]).then(([api]) => api),
+        (async () => {
+            const html = await requestTextSafe(`${host}/pc/live`, {}, {
+                Referer: host + '/pc/live',
+                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            }, 2000);
+            const list = parseLiveCardsFromHtml(html);
+            return filterLiveItems(list, league, type, isHot).slice(0, size);
+        })()
+    ]);
+    
+    if (apiResult && apiResult.length) return apiResult;
+    if (htmlResult && htmlResult.length) return htmlResult;
+    
+    return await fetchLiveByApiFull(page, size, league, type, isHot);
 }
 
-async function fetchLiveMatches(page = 1, size = 30, league = '', type = '', isHot = false) {
-    let list = await fetchLiveByApi(page, size, league, type, isHot);
+// 完整API尝试（后备）
+async function fetchLiveByApiFull(page = 1, size = 30, league = '', type = '', isHot = false) {
+    const date = todayString();
+    const allUrls = [
+        `${host}/api/v1/live`,
+        `${host}/api/v1/lives`,
+        `${host}/api/v1/live/list`,
+        `${host}/api/v1/lives/list`,
+        `${host}/api/v1/live/matches`,
+        `${host}/api/v1/matches/live`,
+        `${host}/api/v1/rooms`,
+        `${host}/api/v1/room/list`,
+        `${host}/api/v1/schedule`,
+        `${host}/api/v1/schedules`,
+        `${host}/api/v1/schedule/today`,
+        `${host}/api/v1/matches`
+    ];
 
-    if (!list.length) {
-        list = await fetchLiveByPage(page, size, league, type, isHot);
+    const paramList = [
+        { page, size, limit: size, league, type, date },
+        { page, pageSize: size, league, type, date },
+        { page, per_page: size, league, type, date },
+        { page, size, league, type, status: 'live' },
+        { page, size, league, type, live: 1 },
+        { page, size, league, type, is_live: 1 }
+    ];
+
+    for (const url of allUrls) {
+        for (const params of paramList) {
+            const cleanParams = {};
+            Object.keys(params).forEach(key => {
+                if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
+                    cleanParams[key] = params[key];
+                }
+            });
+
+            const data = await requestJsonSafe(url, cleanParams, {}, 3000);
+            const arr = getDataArray(data);
+            if (!arr.length) continue;
+
+            const filtered = filterLiveItems(arr, league, type, isHot);
+            if (filtered.length) return filtered.slice(0, size);
+        }
+    }
+
+    return [];
+}
+
+function parseLiveCardsFromHtml(html = '') {
+    const text = safeText(html);
+    if (!text || text === '加载中...') return [];
+
+    const list = [];
+    const roomMatches = text.matchAll(/\/pc\/room\/(\d+)/g);
+    
+    for (const match of roomMatches) {
+        const roomId = match[1];
+        const start = Math.max(0, match.index - 500);
+        const end = Math.min(text.length, match.index + 500);
+        const block = text.slice(start, end);
+
+        const titleMatch = block.match(/([\u4e00-\u9fa5A-Za-z0-9\s]+?\s+vs\s+[\u4e00-\u9fa5A-Za-z0-9\s]+)/i);
+        const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : `直播房间 ${roomId}`;
+
+        const imgMatch = block.match(/https?:\/\/[^"'<>]+?\.(?:jpg|jpeg|png|webp)/i);
+        const pic = imgMatch ? imgMatch[0] : '';
+
+        list.push({
+            id: roomId,
+            room_id: roomId,
+            room_url: `${host}/pc/room/${roomId}`,
+            title: title,
+            cover: pic,
+            status_text: 'LIVE',
+            is_live: 1
+        });
+        
+        if (list.length >= 30) break;
     }
 
     return list;
@@ -458,50 +533,51 @@ async function fetchLiveDetail(roomOrMatchId) {
     const id = safeText(roomOrMatchId);
     if (!id) return null;
 
-    const urls = [
+    const fastUrls = [
         `${host}/api/v1/room/${encodeURIComponent(id)}`,
         `${host}/api/v1/rooms/${encodeURIComponent(id)}`,
-        `${host}/api/v1/live/${encodeURIComponent(id)}`,
-        `${host}/api/v1/lives/${encodeURIComponent(id)}`,
-        `${host}/api/v1/match/${encodeURIComponent(id)}/live`,
-        `${host}/api/v1/match/${encodeURIComponent(id)}/streams`,
-        `${host}/api/v1/matches/${encodeURIComponent(id)}`,
-        `${host}/api/v1/match/${encodeURIComponent(id)}`
+        `${host}/api/v1/live/${encodeURIComponent(id)}`
     ];
 
-    for (const url of urls) {
-        const data = await requestJsonSafe(url, {}, {
-            Referer: `${host}/pc/room/${encodeURIComponent(id)}`
-        });
-
-        if (!data) continue;
-        if (isOk(data)) return data.data;
-        if (typeof data === 'object') return data;
+    for (const url of fastUrls) {
+        const data = await requestJsonSafe(url, {}, {}, 3000);
+        if (data && (isOk(data) || typeof data === 'object')) {
+            return isOk(data) ? data.data : data;
+        }
     }
 
     return null;
 }
 
-// ========== 录像接口 ==========
+// ========== 录像接口（添加缓存） ==========
+
+let recordingsCache = null;
+let cacheTime = 0;
+const CACHE_DURATION = 60000;
 
 async function fetchRecordings(page = 1, size = 30, league = '', type = '') {
-    const params = { page, size };
-
-    if (league) {
-        params.league = league;
-    } else if (type && type !== 'all' && type !== 'nba') {
-        params.type = type;
+    // 简单缓存，避免频繁请求
+    const now = Date.now();
+    if (recordingsCache && (now - cacheTime) < CACHE_DURATION && page === 1 && !league && !type) {
+        return recordingsCache;
     }
-
-    return await requestJsonSafe(`${host}/api/v1/recordings`, params, {
-        Referer: host + '/pc/replay'
-    });
+    
+    const params = { page, size };
+    if (league) params.league = league;
+    else if (type && type !== 'all' && type !== 'nba') params.type = type;
+    
+    const result = await requestJsonSafe(`${host}/api/v1/recordings`, params, {}, 5000);
+    
+    if (page === 1 && !league && !type) {
+        recordingsCache = result;
+        cacheTime = now;
+    }
+    
+    return result;
 }
 
 async function fetchMatchRecordings(matchId) {
-    return await requestJsonSafe(`${host}/api/v1/match/${encodeURIComponent(matchId)}/recordings`, {}, {
-        Referer: host + '/pc/replay'
-    });
+    return await requestJsonSafe(`${host}/api/v1/match/${encodeURIComponent(matchId)}/recordings`, {}, {}, 5000);
 }
 
 // ========== 播放源提取 ==========
@@ -515,7 +591,7 @@ function addPlayable(arr, name, url) {
 }
 
 function collectPlayableLinks(node, prefix = '线路', arr = [], depth = 0) {
-    if (!node || depth > 7) return arr;
+    if (!node || depth > 5) return arr;
 
     if (typeof node === 'string') {
         if (isMediaUrl(node)) {
@@ -525,9 +601,9 @@ function collectPlayableLinks(node, prefix = '线路', arr = [], depth = 0) {
     }
 
     if (Array.isArray(node)) {
-        node.forEach((item, idx) => {
-            collectPlayableLinks(item, `${prefix}${idx + 1}`, arr, depth + 1);
-        });
+        for (let i = 0; i < Math.min(node.length, 10); i++) {
+            collectPlayableLinks(node[i], `${prefix}${i + 1}`, arr, depth + 1);
+        }
         return arr;
     }
 
@@ -539,33 +615,24 @@ function collectPlayableLinks(node, prefix = '线路', arr = [], depth = 0) {
     ], prefix));
 
     const directKeys = [
-        'play_url', 'playUrl',
-        'video_url', 'videoUrl',
-        'stream_url', 'streamUrl',
-        'live_url', 'liveUrl',
-        'm3u8', 'flv', 'hls',
-        'url', 'src', 'link',
-        'hd', 'sd', 'uhd',
-        'source', 'stream'
+        'play_url', 'playUrl', 'video_url', 'videoUrl',
+        'stream_url', 'streamUrl', 'live_url', 'liveUrl',
+        'm3u8', 'flv', 'hls', 'url', 'src'
     ];
 
-    directKeys.forEach(key => {
+    for (const key of directKeys) {
         const value = node[key];
         if (typeof value === 'string' && isMediaUrl(value)) {
             addPlayable(arr, name, value);
         }
-    });
+    }
 
-    Object.keys(node).forEach(key => {
-        if ([
-            'cover', 'cover_image', 'coverImage',
-            'logo', 'home_team_logo', 'away_team_logo',
-            'homeLogo', 'awayLogo', 'avatar'
-        ].includes(key)) {
-            return;
+    const importantKeys = ['data', 'streams', 'sources', 'urls', 'links'];
+    for (const key of importantKeys) {
+        if (node[key]) {
+            collectPlayableLinks(node[key], name, arr, depth + 1);
         }
-        collectPlayableLinks(node[key], name, arr, depth + 1);
-    });
+    }
 
     return arr;
 }
@@ -585,17 +652,13 @@ function buildLivePlayLine(liveItem = {}, detailData = null) {
 
     if (!arr.length) {
         const roomId = safeText(pick(liveItem, [
-            '_live_room_id',
-            'room_id', 'roomId', 'roomid',
-            'live_room_id', 'liveRoomId',
-            'id', 'match_id', 'matchId'
+            '_live_room_id', 'room_id', 'roomId', 'roomid',
+            'live_room_id', 'liveRoomId', 'id', 'match_id', 'matchId'
         ], ''));
 
         const pageUrl = safeText(pick(liveItem, [
-            '_live_page_url',
-            'room_url', 'roomUrl',
-            'page_url', 'pageUrl',
-            'link'
+            '_live_page_url', 'room_url', 'roomUrl',
+            'page_url', 'pageUrl', 'link'
         ], ''));
 
         const finalPage = pageUrl || (roomId ? `${host}/pc/room/${encodeURIComponent(roomId)}` : `${host}/pc/live`);
@@ -609,18 +672,17 @@ function buildEpisodeLine(items = [], prefix = '录像') {
     const arr = [];
     if (!Array.isArray(items)) return '';
 
-    items.forEach((rec, idx) => {
+    for (let idx = 0; idx < Math.min(items.length, 20); idx++) {
+        const rec = items[idx];
         const url = cleanPlayUrl(pick(rec, [
-            'video_url', 'videoUrl',
-            'url',
-            'play_url', 'playUrl'
+            'video_url', 'videoUrl', 'url', 'play_url', 'playUrl'
         ], ''));
 
-        if (!url) return;
+        if (!url) continue;
 
         const name = cleanName(pick(rec, ['title', 'name'], `${prefix}${idx + 1}`));
         arr.push(`${name}$${url}`);
-    });
+    }
 
     return arr.join('#');
 }
@@ -630,48 +692,36 @@ function buildEpisodeLine(items = [], prefix = '录像') {
 function parseLiveList(items = []) {
     if (!Array.isArray(items)) return [];
 
-    return items.map(item => {
+    return items.slice(0, 50).map(item => {
         const titleRaw = safeText(pick(item, ['title', 'name', 'match_name', 'matchName'], ''));
         const league = safeText(getLeagueText(item), '直播');
 
         const home = safeText(pick(item, [
-            'home_team', 'homeTeam',
-            'home_name', 'homeName',
-            'team1', 'home'
+            'home_team', 'homeTeam', 'home_name', 'homeName', 'team1', 'home'
         ], ''));
 
         const away = safeText(pick(item, [
-            'away_team', 'awayTeam',
-            'away_name', 'awayName',
-            'team2', 'away'
+            'away_team', 'awayTeam', 'away_name', 'awayName', 'team2', 'away'
         ], ''));
 
         const title = titleRaw || joinTitle(home, away, league);
 
         const time = safeText(pick(item, [
-            'start_time', 'startTime',
-            'match_time', 'matchTime',
-            'time'
+            'start_time', 'startTime', 'match_time', 'matchTime', 'time'
         ], '正在直播'));
 
         const roomId = safeText(pick(item, [
-            'room_id', 'roomId', 'roomid',
-            'live_room_id', 'liveRoomId',
+            'room_id', 'roomId', 'roomid', 'live_room_id', 'liveRoomId',
             'id', 'match_id', 'matchId'
         ], ''));
 
         const status = safeText(pick(item, [
-            'status_text', 'statusText',
-            'status', 'match_status', 'matchStatus',
-            'state'
+            'status_text', 'statusText', 'status', 'match_status', 'matchStatus', 'state'
         ], 'LIVE'));
 
         let pic = pick(item, [
-            'cover_image', 'coverImage',
-            'cover', 'thumb', 'thumbnail',
-            'home_team_logo', 'homeLogo',
-            'away_team_logo', 'awayLogo',
-            'logo', 'pic'
+            'cover_image', 'coverImage', 'cover', 'thumb', 'thumbnail',
+            'home_team_logo', 'homeLogo', 'away_team_logo', 'awayLogo', 'logo', 'pic'
         ], '');
 
         pic = fixUrl(pic);
@@ -696,23 +746,17 @@ function parseLiveList(items = []) {
 function parseVideoList(items = [], showScore = true) {
     if (!Array.isArray(items)) return [];
 
-    return items.map(item => {
+    return items.slice(0, 50).map(item => {
         const home = safeText(pick(item, [
-            'home_team', 'homeTeam',
-            'home_name', 'homeName',
-            'team1', 'home'
+            'home_team', 'homeTeam', 'home_name', 'homeName', 'team1', 'home'
         ], '主队'));
 
         const away = safeText(pick(item, [
-            'away_team', 'awayTeam',
-            'away_name', 'awayName',
-            'team2', 'away'
+            'away_team', 'awayTeam', 'away_name', 'awayName', 'team2', 'away'
         ], '客队'));
 
         const league = safeText(pick(item, [
-            'league_name', 'leagueName',
-            'league',
-            'competition_name', 'competitionName'
+            'league_name', 'leagueName', 'league', 'competition_name', 'competitionName'
         ], '赛事'));
 
         const title = joinTitle(home, away, league);
@@ -722,31 +766,23 @@ function parseVideoList(items = [], showScore = true) {
         const score = `${homeScore} - ${awayScore}`;
 
         const time = safeText(pick(item, [
-            'start_time', 'startTime',
-            'match_time', 'matchTime',
-            'time'
+            'start_time', 'startTime', 'match_time', 'matchTime', 'time'
         ], ''));
 
         const count = safeNumber(pick(item, [
-            'recording_count', 'recordingCount',
-            'replay_count', 'video_count'
+            'recording_count', 'recordingCount', 'replay_count', 'video_count'
         ], '0'));
 
         let pic = pick(item, [
-            'cover_image', 'coverImage',
-            'cover',
-            'home_team_logo', 'homeLogo',
-            'away_team_logo', 'awayLogo',
-            'logo', 'pic'
+            'cover_image', 'coverImage', 'cover',
+            'home_team_logo', 'homeLogo', 'away_team_logo', 'awayLogo', 'logo', 'pic'
         ], '');
 
         pic = fixUrl(pic);
 
         if (pic.includes('default_cover')) {
             pic = fixUrl(pick(item, [
-                'home_team_logo', 'homeLogo',
-                'away_team_logo', 'awayLogo',
-                'logo'
+                'home_team_logo', 'homeLogo', 'away_team_logo', 'awayLogo', 'logo'
             ], ''));
         }
 
@@ -778,10 +814,13 @@ async function home(filter) {
 
 async function homeVod() {
     try {
-        const liveItems = await fetchLiveMatches(1, 30, '', '', false);
+        // 并行请求直播和录像
+        const [liveItems, data] = await Promise.all([
+            fetchLiveMatches(1, 30, '', '', false),
+            fetchRecordings(1, 20)
+        ]);
+        
         const liveList = parseLiveList(liveItems);
-
-        const data = await fetchRecordings(1, 20);
         const replayList = isOk(data) ? parseVideoList(getDataArray(data)) : [];
 
         return JSON.stringify({
@@ -851,39 +890,27 @@ async function detail(id) {
 
         if (liveItem) {
             const roomId = safeText(pick(liveItem, [
-                '_live_room_id',
-                'room_id', 'roomId', 'roomid',
-                'live_room_id', 'liveRoomId',
-                'id', 'match_id', 'matchId'
+                '_live_room_id', 'room_id', 'roomId', 'roomid',
+                'live_room_id', 'liveRoomId', 'id', 'match_id', 'matchId'
             ], ''));
 
             const detailData = roomId ? await fetchLiveDetail(roomId) : null;
 
             const title = safeText(pick(liveItem, [
-                '_live_title',
-                'title', 'name', 'match_name', 'matchName'
+                '_live_title', 'title', 'name', 'match_name', 'matchName'
             ], '正在直播'));
 
             const league = safeText(pick(liveItem, [
-                '_live_league',
-                'league_name', 'leagueName',
-                'league',
-                'competition_name', 'competitionName'
+                '_live_league', 'league_name', 'leagueName', 'league', 'competition_name', 'competitionName'
             ], '直播'));
 
             const time = safeText(pick(liveItem, [
-                '_live_time',
-                'start_time', 'startTime',
-                'match_time', 'matchTime',
-                'time'
+                '_live_time', 'start_time', 'startTime', 'match_time', 'matchTime', 'time'
             ], '正在直播'));
 
             const pic = fixUrl(pick(liveItem, [
-                'cover_image', 'coverImage',
-                'cover', 'thumb', 'thumbnail',
-                'home_team_logo', 'homeLogo',
-                'away_team_logo', 'awayLogo',
-                'logo', 'pic'
+                'cover_image', 'coverImage', 'cover', 'thumb', 'thumbnail',
+                'home_team_logo', 'homeLogo', 'away_team_logo', 'awayLogo', 'logo', 'pic'
             ], ''));
 
             const playLine = buildLivePlayLine(liveItem, detailData);
@@ -912,21 +939,15 @@ async function detail(id) {
         const highlights = root.highlights || [];
 
         const home = safeText(pick(match, [
-            'home_team', 'homeTeam',
-            'home_name', 'homeName',
-            'team1', 'home'
+            'home_team', 'homeTeam', 'home_name', 'homeName', 'team1', 'home'
         ], '主队'));
 
         const away = safeText(pick(match, [
-            'away_team', 'awayTeam',
-            'away_name', 'awayName',
-            'team2', 'away'
+            'away_team', 'awayTeam', 'away_name', 'awayName', 'team2', 'away'
         ], '客队'));
 
         const league = safeText(pick(match, [
-            'league_name', 'leagueName',
-            'league',
-            'competition_name', 'competitionName'
+            'league_name', 'leagueName', 'league', 'competition_name', 'competitionName'
         ], '赛事'));
 
         const title = joinTitle(home, away, league);
@@ -934,9 +955,7 @@ async function detail(id) {
         const score = `${safeNumber(pick(match, ['home_score', 'homeScore', 'score_home'], '-'))} - ${safeNumber(pick(match, ['away_score', 'awayScore', 'score_away'], '-'))}`;
 
         const time = safeText(pick(match, [
-            'start_time', 'startTime',
-            'match_time', 'matchTime',
-            'time'
+            'start_time', 'startTime', 'match_time', 'matchTime', 'time'
         ], ''));
 
         const round = safeText(pick(match, ['match_round', 'matchRound', 'round'], ''));
@@ -957,11 +976,8 @@ async function detail(id) {
         }
 
         const pic = fixUrl(pick(match, [
-            'cover_image', 'coverImage',
-            'cover',
-            'home_team_logo', 'homeLogo',
-            'away_team_logo', 'awayLogo',
-            'logo', 'pic'
+            'cover_image', 'coverImage', 'cover',
+            'home_team_logo', 'homeLogo', 'away_team_logo', 'awayLogo', 'logo', 'pic'
         ], ''));
 
         const vodInfo = {
@@ -992,15 +1008,18 @@ async function search(wd, quick, pg = 1) {
             });
         }
 
-        const liveItems = await fetchLiveMatches(1, 100);
+        // 并行搜索直播和录像
+        const [liveItems, data] = await Promise.all([
+            fetchLiveMatches(1, 100),
+            fetchRecordings(1, 100)
+        ]);
+        
         const filteredLive = liveItems.filter(item => {
             return liveTitleText(item).toLowerCase().includes(keyword);
         });
         const liveList = parseLiveList(filteredLive);
 
-        const data = await fetchRecordings(1, 100);
         let replayList = [];
-
         if (isOk(data)) {
             const arr = getDataArray(data);
             const filteredReplay = arr.filter(item => {
