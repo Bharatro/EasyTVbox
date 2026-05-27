@@ -626,6 +626,7 @@ function collectPlayableLinks(node, prefix = '线路', arr = [], depth = 0) {
         }
     }
 
+
     const importantKeys = ['data', 'streams', 'sources', 'urls', 'links'];
     for (const key of importantKeys) {
         if (node[key]) {
